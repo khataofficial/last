@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="ur">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1419">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>Safar Alarm</title>
+<link rel="stylesheet" href="leaflet/leaflet.css">
+<style>
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;font-family:system-ui,sans-serif;background:#0f1419;color:#e8eef5}
+#app{display:flex;flex-direction:column;height:100%}
+#map{flex:1;min-height:0}
+#panel{padding:10px;background:#18202a;border-top:2px solid #2a3644;max-height:42%;overflow:auto}
+.row{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+button{background:#2ecc71;color:#06210f;border:0;border-radius:8px;padding:10px 12px;font-weight:700;font-size:14px}
+button.alt{background:#2a3644;color:#e8eef5}
+button.red{background:#e74c3c;color:#fff}
+input[type=range]{flex:1;min-width:120px}
+#status{font-size:13px;color:#9db0c4;margin-bottom:6px}
+#net{font-size:12px;margin-left:auto}
+.pt{display:flex;justify-content:space-between;align-items:center;padding:7px 8px;background:#202b38;border-radius:8px;margin-bottom:5px;font-size:14px}
+.pt small{color:#9db0c4;display:block}
+.pt button{padding:5px 9px;background:#e74c3c;color:#fff}
+.pin{font-size:26px;line-height:1;text-align:center;filter:drop-shadow(0 1px 2px #000)}
+#alarm{position:fixed;inset:0;background:#c0392b;display:none;flex-direction:column;align-items:center;justify-content:center;z-index:9999;text-align:center;padding:20px;animation:fl .6s infinite alternate}
+#alarm h1{font-size:34px;margin:0 0 10px}
+#alarm button{background:#fff;color:#c0392b;font-size:20px;padding:16px 30px;margin-top:20px}
+@keyframes fl{to{background:#7b241c}}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="map"></div>
+  <div id="panel">
+    <div id="status">Map par tap kar ke apni manzil / area ka point lagayein.</div>
+    <div class="row">
+      <button id="bTrack">▶ Safar Shuru</button>
+      <button id="bDl" class="alt" style="display:none">⬇ Circle ka Map Download</button>
+      <button id="bLoc" class="alt">📍 Meri Jagah</button>
+      <button id="bInstall" class="alt" style="display:none">📲 App Install</button>
+      <span id="net"></span>
+    </div>
+    <div class="row">
+      <span style="font-size:13px">Alarm doori:</span>
+      <input type="range" id="rad" min="100" max="3000" step="100" value="500">
+      <b id="radv" style="font-size:13px">500 m</b>
+    </div>
+    <div id="list"></div>
+  </div>
+</div>
+<div id="alarm">
+  <h1>⏰ Aapka area aa gaya!</h1>
+  <div id="alarmTxt" style="font-size:20px"></div>
+  <button id="bStop">Alarm Band Karein</button>
+</div>
+
+<script src="leaflet/leaflet.js"></script>
+<script>
+const CN='safar-tiles-v1', URL_T='https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+const $=id=>document.getElementById(id);
+let points=[], tracking=false, watchId=null, userMarker=null, wake=null;
+
+// ---- PWA ----
+if('serviceWorker' in navigator)addEventListener('load',()=>navigator.serviceWorker.register('sw.js').catch(()=>{}));
+let dip=null;
+addEventListener('beforeinstallprompt',e=>{e.preventDefault();dip=e;$('bInstall').style.display=''});
+$('bInstall').onclick=async()=>{if(!dip)return;dip.prompt();await dip.userChoice;dip=null;$('bInstall').style.display='none'};
+const netUpd=()=>{$('net').textContent=navigator.onLine?'🟢 online':'🔴 offline';$('net').style.color=navigator.onLine?'#2ecc71':'#e74c3c'};
+addEventListener('online',netUpd);addEventListener('offline',netUpd);netUpd();
+
+// ---- saved points ----
+try{points=JSON.parse(localStorage.getItem('sa_pts')||'[]')}catch(e){}
+const save=()=>{try{localStorage.setItem('sa_pts',JSON.stringify(points))}catch(e){}};
+
+// ---- map (tiles served from cache by service worker when offline) ----
+const map=L.map('map').setView([24.8607,67.0011],12);
+L.tileLayer(URL_T,{maxZoom:18,attribution:'© OpenStreetMap'}).addTo(map);
+const pinIcon=L.divIcon({html:'📍',className:'pin',iconSize:[30,30],iconAnchor:[15,28]});
+
+// ---- distance ----
+function dist(a,b,c,d){
+  const R=6371000,f=Math.PI/180,dl=(c-a)*f,dg=(d-b)*f;
+  const h=Math.sin(dl/2)**2+Math.cos(a*f)*Math.cos(c*f)*Math.sin(dg/2)**2;
+  return 2*R*Math.asin(Math.sqrt(h));
+}
+
+// ---- points + area circle ----
+const layer=L.layerGroup().addTo(map);
+function areaCircle(){
+  if(!points.length)return null;
+  let la=0,lo=0;
+  points.forEach(p=>{la+=p.lat;lo+=p.lng});
+  la/=points.length; lo/=points.length;
+  let R=0;
+  points.forEach(p=>{R=Math.max(R,dist(la,lo,p.lat,p.lng)+p.r)});
+  return {la,lo,R:R+500};
+}
+function draw(){
+  layer.clearLayers(); $('list').innerHTML='';
+  points.forEach((p,i)=>{
+    L.marker([p.lat,p.lng],{icon:pinIcon}).addTo(layer).bindTooltip(p.name);
+    L.circle([p.lat,p.lng],{radius:p.r,color:p.done?'#888':'#e74c3c',weight:2,fillOpacity:.12,interactive:false}).addTo(layer);
+    const d=document.createElement('div'); d.className='pt';
+    const t=document.createElement('div');
+    t.textContent=(p.done?'✅ ':'🔔 ')+p.name;
+    const s=document.createElement('small'); s.textContent=p.r+' m par alarm'; t.appendChild(s);
+    d.appendChild(t);
+    const b=document.createElement('button'); b.textContent='Hatao';
+    b.onclick=()=>{points.splice(i,1);save();draw()};
+    d.appendChild(b); $('list').appendChild(d);
+  });
+  const a=areaCircle();
+  $('bDl').style.display=a?'':'none';
+  if(a)L.circle([a.la,a.lo],{radius:a.R,color:'#3498db',weight:2,dashArray:'8 6',fillOpacity:.05,interactive:false}).addTo(layer);
+}
+map.on('click',e=>{
+  const name=prompt('Is point ka naam (jese: Office, Stop, Gali):','Point '+(points.length+1));
+  if(name===null)return;
+  points.push({name:name||('Point '+(points.length+1)),lat:e.latlng.lat,lng:e.latlng.lng,r:+$('rad').value,done:false});
+  save();draw();
+});
+$('rad').oninput=()=>$('radv').textContent=$('rad').value+' m';
+draw();
+if(points.length)map.setView([points[0].lat,points[0].lng],13);
+
+// ---- circle map download ----
+const tx=(lng,z)=>Math.floor((lng+180)/360*2**z);
+const ty=(lat,z)=>{const r=lat*Math.PI/180;return Math.floor((1-Math.log(Math.tan(r)+1/Math.cos(r))/Math.PI)/2*2**z)};
+const t2lat=(y,z)=>Math.atan(Math.sinh(Math.PI*(1-2*y/2**z)))*180/Math.PI;
+const t2lng=(x,z)=>x/2**z*360-180;
+
+$('bDl').onclick=async()=>{
+  const a=areaCircle(); if(!a)return;
+  if(!window.caches){alert('Is browser mein offline cache support nahi hai (HTTPS chahiye).');return}
+  const dLat=a.R/111320, dLng=a.R/(111320*Math.cos(a.la*Math.PI/180));
+  const N=a.la+dLat,S=a.la-dLat,W=a.lo-dLng,E=a.lo+dLng;
+  function build(zmax){
+    const urls=[];
+    for(let z=12;z<=zmax;z++){
+      const tileM=40075016*Math.cos(a.la*Math.PI/180)/2**z;
+      for(let x=tx(W,z);x<=tx(E,z);x++)
+        for(let y=ty(N,z);y<=ty(S,z);y++){
+          if(dist(a.la,a.lo,t2lat(y+.5,z),t2lng(x+.5,z))<=a.R+tileM*0.75)
+            urls.push(URL_T.replace('{z}',z).replace('{x}',x).replace('{y}',y));
+        }
+    }
+    return urls;
+  }
+  let zmax=16, urls=build(zmax);
+  while(urls.length>1500&&zmax>13){zmax--;urls=build(zmax)}
+  if(urls.length>1500){alert('Points ka area bohat bara hai ('+urls.length+' tiles). Points qareeb lagayein.');return}
+  if(!confirm(urls.length+' tiles download honge (zoom 12–'+zmax+'). Theek hai?'))return;
+  map.fitBounds(L.circle([a.la,a.lo],{radius:a.R}).getBounds());
+  const cache=await caches.open(CN); let n=0,fail=0,q=[...urls];
+  async function worker(){
+    while(q.length){
+      const u=q.pop();
+      try{ if(!(await cache.match(u))){const r=await fetch(u);if(r.ok)await cache.put(u,r);else fail++} }catch(e){fail++}
+      $('status').textContent='Map download: '+(++n)+' / '+urls.length;
+    }
+  }
+  await Promise.all([worker(),worker(),worker(),worker()]);
+  $('status').textContent=fail?('⚠ '+fail+' tiles nahi aaye — internet check kar ke dobara dabayein.'):'✅ Circle ka map download ho gaya — ab internet ke baghair bhi chalega.';
+};
+
+// ---- location ----
+function onPos(pos){
+  const {latitude:la,longitude:lo}=pos.coords, ll=[la,lo];
+  if(!userMarker)userMarker=L.circleMarker(ll,{radius:8,color:'#fff',fillColor:'#3498db',fillOpacity:1,weight:3}).addTo(map);
+  else userMarker.setLatLng(ll);
+  let near=null;
+  points.forEach(p=>{
+    if(p.done)return;
+    const d=dist(la,lo,p.lat,p.lng);
+    if(!near||d<near.d)near={d,p};
+    if(d<=p.r){p.done=true;save();draw();ring(p.name,d)}
+  });
+  $('status').textContent=near?`Sab se qareeb: ${near.p.name} — ${Math.round(near.d)} m door`:'Koi active point nahi.';
+}
+async function getWake(){try{wake=await navigator.wakeLock.request('screen')}catch(e){}}
+document.addEventListener('visibilitychange',()=>{if(tracking&&document.visibilityState==='visible')getWake()});
+$('bLoc').onclick=()=>navigator.geolocation.getCurrentPosition(p=>{map.setView([p.coords.latitude,p.coords.longitude],15);onPos(p)},e=>alert('Location allow karein: '+e.message),{enableHighAccuracy:true});
+$('bTrack').onclick=async()=>{
+  if(!tracking){
+    if(!points.length){alert('Pehle map par kam az kam ek point lagayein.');return}
+    unlockAudio();
+    watchId=navigator.geolocation.watchPosition(onPos,e=>alert('GPS error: '+e.message),{enableHighAccuracy:true,maximumAge:3000});
+    await getWake();
+    tracking=true;$('bTrack').textContent='⏹ Safar Band';$('bTrack').className='red';
+  }else{
+    navigator.geolocation.clearWatch(watchId);try{wake&&wake.release()}catch(e){}
+    tracking=false;$('bTrack').textContent='▶ Safar Shuru';$('bTrack').className='';
+  }
+};
+
+// ---- alarm ----
+let ac=null,beepT=null;
+function unlockAudio(){try{ac=ac||new (window.AudioContext||window.webkitAudioContext)();ac.resume()}catch(e){}}
+function beep(){
+  if(!ac)return;
+  const o=ac.createOscillator(),g=ac.createGain();
+  o.type='square';o.frequency.value=880;g.gain.value=.4;
+  o.connect(g);g.connect(ac.destination);o.start();o.stop(ac.currentTime+.25);
+}
+function ring(name,d){
+  $('alarmTxt').textContent=name+' — sirf '+Math.round(d)+' m door';
+  $('alarm').style.display='flex';
+  beep();clearInterval(beepT);
+  beepT=setInterval(()=>{beep();navigator.vibrate&&navigator.vibrate([300,150,300])},600);
+}
+$('bStop').onclick=()=>{clearInterval(beepT);$('alarm').style.display='none';navigator.vibrate&&navigator.vibrate(0)};
+</script>
+</body>
+</html>
